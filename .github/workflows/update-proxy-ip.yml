@@ -1,0 +1,145 @@
+name: Update Proxy IP to Cloudflare
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时运行一次
+  workflow_dispatch:  # 允许手动触发
+
+jobs:
+  update-dns:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests
+
+    - name: Create and run update script
+      run: |
+        cat > update_dns.py << 'EOF'
+        import requests
+        import os
+        import json
+        
+        # 配置信息
+        PROXY_URL = "https://github.com/leung7963/CF-PROXYIP/blob/main/proxyip.txt"
+        RAW_PROXY_URL = "https://raw.githubusercontent.com/leung7963/CF-PROXYIP/main/proxyip.txt"
+        
+        # 从secrets获取Cloudflare配置
+        CF_API_TOKEN = os.getenv('CF_API_TOKEN')
+        ZONE_ID = os.getenv('CF_ZONE_ID')
+        DNS_RECORD_ID = os.getenv('CF_DNS_RECORD_ID')
+        DOMAIN_NAME = os.getenv('CF_DOMAIN_NAME')  # 例如: proxy.example.com
+        
+        def get_proxy_ips():
+            """从GitHub获取代理IP列表"""
+            try:
+                response = requests.get(RAW_PROXY_URL, timeout=10)
+                response.raise_for_status()
+                ips = response.text.strip().split('\n')
+                # 过滤空行和无效IP
+                valid_ips = [ip.strip() for ip in ips if ip.strip() and '.' in ip.strip()]
+                return valid_ips
+            except Exception as e:
+                print(f"获取代理IP失败: {e}")
+                return None
+        
+        def get_current_dns_record():
+            """获取当前的DNS记录"""
+            url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{DNS_RECORD_ID}"
+            headers = {
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                print(f"获取DNS记录失败: {e}")
+                return None
+        
+        def update_dns_record(new_ip):
+            """更新DNS记录到新的IP"""
+            url = f"https://api.cloudflare.com/client/v4/zones/{ZONE_ID}/dns_records/{DNS_RECORD_ID}"
+            headers = {
+                "Authorization": f"Bearer {CF_API_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "type": "A",
+                "name": DOMAIN_NAME,
+                "content": new_ip,
+                "ttl": 1,  # 自动TTL
+                "proxied": False  # 不经过Cloudflare代理
+            }
+            
+            try:
+                response = requests.put(url, headers=headers, json=data, timeout=10)
+                response.raise_for_status()
+                result = response.json()
+                
+                if result.get('success'):
+                    print(f"DNS记录更新成功: {DOMAIN_NAME} -> {new_ip}")
+                    return True
+                else:
+                    print(f"DNS记录更新失败: {result.get('errors', '未知错误')}")
+                    return False
+                    
+            except Exception as e:
+                print(f"更新DNS记录时出错: {e}")
+                return False
+        
+        def main():
+            # 获取代理IP列表
+            ips = get_proxy_ips()
+            if not ips:
+                print("无法获取代理IP列表")
+                return False
+            
+            first_ip = ips[0]
+            print(f"获取到的第一个IP: {first_ip}")
+            
+            # 获取当前DNS记录
+            current_record = get_current_dns_record()
+            if current_record and current_record.get('success'):
+                current_ip = current_record['result']['content']
+                print(f"当前DNS记录IP: {current_ip}")
+                
+                # 如果IP相同，不需要更新
+                if current_ip == first_ip:
+                    print("IP地址未变化，无需更新")
+                    return True
+            
+            # 更新DNS记录
+            return update_dns_record(first_ip)
+        
+        if __name__ == "__main__":
+            main()
+        EOF
+        
+        python update_dns.py
+      env:
+        CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+        CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
+        CF_DNS_RECORD_ID: ${{ secrets.CF_DNS_RECORD_ID }}
+        CF_DOMAIN_NAME: ${{ secrets.CF_DOMAIN_NAME }}
+
+    - name: Commit and push if changed
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .
+        git commit -m "Update DNS record via GitHub Actions" || echo "No changes to commit"
+        git push
